@@ -20,6 +20,7 @@ package eu.fasten.analyzer.metadataplugin;
 
 import eu.fasten.core.data.Constants;
 import eu.fasten.core.data.ExtendedRevisionJavaCallGraph;
+import eu.fasten.core.data.ExtendedRevisionCallGraph;
 import eu.fasten.core.data.Graph;
 import eu.fasten.core.data.JavaType;
 import eu.fasten.core.data.JavaScope;
@@ -101,12 +102,12 @@ public class MetadataDatabasePlugin extends Plugin {
                 consumedJson = consumedJson.getJSONObject("payload");
             }
             final var path = consumedJson.optString("dir");
-            final ExtendedRevisionJavaCallGraph callgraph;
+            final ExtendedRevisionCallGraph callgraph;
             if (!path.isEmpty()) {
                 // Parse ERCG from file
                 try {
                     JSONTokener tokener = new JSONTokener(new FileReader(path));
-                    callgraph = new ExtendedRevisionJavaCallGraph(new JSONObject(tokener));
+                    consumedJson = new JSONObject(tokener);
                 } catch (JSONException | IOException e) {
                     logger.error("Error parsing JSON callgraph from path for '"
                             + Paths.get(path).getFileName() + "'", e);
@@ -114,17 +115,19 @@ public class MetadataDatabasePlugin extends Plugin {
                     setPluginError(e);
                     return;
                 }
-            } else {
-                // Parse ERCG straight from consumed record
-                try {
-                    callgraph = new ExtendedRevisionJavaCallGraph(consumedJson);
-                } catch (JSONException e) {
-                    logger.error("Error parsing JSON callgraph for '"
-                            + Paths.get(path).getFileName() + "'", e);
-                    processedRecord = false;
-                    setPluginError(e);
-                    return;
-                }
+            }
+            try {
+                // TODO check forge and create an object from the appropriate
+                // ExtendedRevisionCallGraph
+                // we will have to cast to subclass type in the saveToDatabase
+                // method.
+                callgraph = new ExtendedRevisionJavaCallGraph(consumedJson);
+            } catch (JSONException e) {
+                logger.error("Error parsing JSON callgraph for '"
+                        + Paths.get(path).getFileName() + "'", e);
+                processedRecord = false;
+                setPluginError(e);
+                return;
             }
             final var mvnCoordinate = callgraph.product + Constants.mvnCoordinateSeparator
                     + callgraph.version;
@@ -204,7 +207,7 @@ public class MetadataDatabasePlugin extends Plugin {
          * @param metadataDao Data Access Object to insert records in the database
          * @return Package ID saved in the database
          */
-        public long saveToDatabase(ExtendedRevisionJavaCallGraph callGraph, MetadataDao metadataDao) {
+        public long saveToDatabase(ExtendedRevisionCallGraph callGraph, MetadataDao metadataDao) {
             // Insert package record
             final long packageId = metadataDao.insertPackage(callGraph.product, callGraph.forge);
 
@@ -213,26 +216,8 @@ public class MetadataDatabasePlugin extends Plugin {
                     callGraph.getCgGenerator(), callGraph.version,
                     getProperTimestamp(callGraph.timestamp), new JSONObject());
 
-            var cha = callGraph.getClassHierarchy();
-            var internalTypes = cha.get(JavaScope.internalTypes);
-            var callables = new ArrayList<CallablesRecord>();
-
-            // Insert all modules, files, module contents and extract callables from internal types
-            for (var fastenUri : internalTypes.keySet()) {
-                var type = internalTypes.get(fastenUri);
-                var moduleId = insertModule(type, fastenUri, packageVersionId, metadataDao);
-                var fileId = metadataDao.insertFile(packageVersionId, type.getSourceFileName());
-                metadataDao.insertModuleContent(moduleId, fileId);
-                callables.addAll(extractCallablesFromType(type, moduleId, true));
-            }
+            var callables = instertDataExtractCallables(callGraph, metadataDao, packageVersionId);
             final var numInternal = callables.size();
-
-            var externalTypes = cha.get(JavaScope.externalTypes);
-            // Extract all external callables
-            for (var fastenUri : externalTypes.keySet()) {
-                var type = externalTypes.get(fastenUri);
-                callables.addAll(extractCallablesFromType(type, -1L, false));
-            }
 
             var callablesIds = new LongArrayList(callables.size());
             // Save all callables in the database
@@ -251,6 +236,29 @@ public class MetadataDatabasePlugin extends Plugin {
             this.gidGraph = new GidGraph(packageVersionId, callGraph.product, callGraph.version,
                     callablesIds, numInternal, edges);
             return packageVersionId;
+        }
+
+        public ArrayList<CallablesRecord> instertDataExtractCallables(ExtendedRevisionCallGraph callgraph, MetadataDao metadataDao, long packageVersionId) {
+            ExtendedRevisionJavaCallGraph javaCallGraph = (ExtendedRevisionJavaCallGraph) callgraph;
+            var callables = new ArrayList<CallablesRecord>();
+            var cha = javaCallGraph.getClassHierarchy();
+            var internalTypes = cha.get(JavaScope.internalTypes);
+            // Insert all modules, files, module contents and extract callables from internal types
+            for (var fastenUri : internalTypes.keySet()) {
+                var type = internalTypes.get(fastenUri);
+                var moduleId = insertModule(type, fastenUri, packageVersionId, metadataDao);
+                var fileId = metadataDao.insertFile(packageVersionId, type.getSourceFileName());
+                metadataDao.insertModuleContent(moduleId, fileId);
+                callables.addAll(extractCallablesFromType(type, moduleId, true));
+            }
+
+            var externalTypes = cha.get(JavaScope.externalTypes);
+            // Extract all external callables
+            for (var fastenUri : externalTypes.keySet()) {
+                var type = externalTypes.get(fastenUri);
+                callables.addAll(extractCallablesFromType(type, -1L, false));
+            }
+            return callables;
         }
 
         private long insertModule(JavaType type, FastenURI fastenUri,
